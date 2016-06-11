@@ -1,0 +1,314 @@
+From e522c4a3ad733321117c9a0240a730c2b14874cc Mon Sep 17 00:00:00 2001
+From: dell <dell@dell.(none)>
+Date: Tue, 3 May 2016 06:33:26 -0400
+Subject: [PATCH] add support new chip Realtek Semiconductor Co., Ltd. RTS525A PCI Express Card Reader [10ec:525a] (rev 01)
+
+---
+ drivers/mfd/rts5249.c        |  176 ++++++++++++++++++++++++++++++++++++++++++
+ drivers/mfd/rtsx_pcr.c       |   12 ++-
+ drivers/mfd/rtsx_pcr.h       |    2 +
+ include/linux/mfd/rtsx_pci.h |   19 +++++
+ 4 files changed, 206 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/mfd/rts5249.c b/drivers/mfd/rts5249.c
+index 6a97e6e..d067bc5 100644
+--- a/drivers/mfd/rts5249.c
++++ b/drivers/mfd/rts5249.c
+@@ -34,6 +34,78 @@ static u8 rts5249_get_ic_version(struct rtsx_pcr *pcr)
+ 	return val & 0x0F;
+ }
+ 
++static void rts5249_fill_driving(struct rtsx_pcr *pcr, u8 voltage)
++{
++	u8 driving_3v3[4][3] = {
++		{0x11, 0x11, 0x18},
++		{0x55, 0x55, 0x5C},
++		{0xFF, 0xFF, 0xFF},
++		{0x96, 0x96, 0x96},
++	};
++	u8 driving_1v8[4][3] = {
++		{0xC4, 0xC4, 0xC4},
++		{0x3C, 0x3C, 0x3C},
++		{0xFE, 0xFE, 0xFE},
++		{0xB3, 0xB3, 0xB3},
++	};
++	u8 (*driving)[3], drive_sel;
++
++	if (voltage == OUTPUT_3V3) {
++		driving = driving_3v3;
++		drive_sel = pcr->sd30_drive_sel_3v3;
++	} else {
++		driving = driving_1v8;
++		drive_sel = pcr->sd30_drive_sel_1v8;
++	}
++
++	rtsx_pci_add_cmd(pcr, WRITE_REG_CMD, SD30_CLK_DRIVE_SEL,
++			0xFF, driving[drive_sel][0]);
++	rtsx_pci_add_cmd(pcr, WRITE_REG_CMD, SD30_CMD_DRIVE_SEL,
++			0xFF, driving[drive_sel][1]);
++	rtsx_pci_add_cmd(pcr, WRITE_REG_CMD, SD30_DAT_DRIVE_SEL,
++			0xFF, driving[drive_sel][2]);
++}
++
++static void rtsx_base_fetch_vendor_settings(struct rtsx_pcr *pcr)
++{
++	u32 reg;
++
++	rtsx_pci_read_config_dword(pcr, PCR_SETTING_REG1, &reg);
++	pcr_dbg(pcr, "Cfg 0x%x: 0x%x\n", PCR_SETTING_REG1, reg);
++
++	if (!rtsx_vendor_setting_valid(reg)) {
++		pcr_dbg(pcr, "skip fetch vendor setting\n");
++		return;
++	}
++
++	pcr->aspm_en = rtsx_reg_to_aspm(reg);
++	pcr->sd30_drive_sel_1v8 = rtsx_reg_to_sd30_drive_sel_1v8(reg);
++	pcr->card_drive_sel &= 0x3F;
++	pcr->card_drive_sel |= rtsx_reg_to_card_drive_sel(reg);
++
++	rtsx_pci_read_config_dword(pcr, PCR_SETTING_REG2, &reg);
++	pcr_dbg(pcr, "Cfg 0x%x: 0x%x\n", PCR_SETTING_REG2, reg);
++	pcr->sd30_drive_sel_3v3 = rtsx_reg_to_sd30_drive_sel_3v3(reg);
++	if (rtsx_reg_check_reverse_socket(reg))
++		pcr->flags |= PCR_REVERSE_SOCKET;
++}
++
++static void rtsx_base_force_power_down(struct rtsx_pcr *pcr, u8 pm_state)
++{
++	/* Set relink_time to 0 */
++	rtsx_pci_write_register(pcr, AUTOLOAD_CFG_BASE + 1, 0xFF, 0);
++	rtsx_pci_write_register(pcr, AUTOLOAD_CFG_BASE + 2, 0xFF, 0);
++	rtsx_pci_write_register(pcr, AUTOLOAD_CFG_BASE + 3, 0x01, 0);
++
++	if (pm_state == HOST_ENTER_S3)
++		rtsx_pci_write_register(pcr, pcr->reg_pm_ctrl3,
++			D3_DELINK_MODE_EN, D3_DELINK_MODE_EN);
++
++	rtsx_pci_write_register(pcr, FPDCTL, 0x03, 0x03);
++}
++
++
++
+ static int rts5249_extra_init_hw(struct rtsx_pcr *pcr)
+ {
+ 	rtsx_pci_init_cmd(pcr);
+@@ -291,3 +363,107 @@ void rts5249_init_params(struct rtsx_pcr *pcr)
+ 	pcr->ms_pull_ctl_enable_tbl = rts5249_ms_pull_ctl_enable_tbl;
+ 	pcr->ms_pull_ctl_disable_tbl = rts5249_ms_pull_ctl_disable_tbl;
+ }
++
++static int rts525a_card_power_on(struct rtsx_pcr *pcr, int card)
++{
++	rtsx_pci_write_register(pcr, LDO_VCC_CFG1,
++		LDO_VCC_TUNE_MASK, LDO_VCC_3V3);
++	return rts5249_card_power_on(pcr, card);
++}
++
++static int rts525a_switch_output_voltage(struct rtsx_pcr *pcr, u8 voltage)
++{
++	switch (voltage) {
++	case OUTPUT_3V3:
++		rtsx_pci_write_register(pcr, LDO_CONFIG2,
++			LDO_D3318_MASK, LDO_D3318_33V);
++		rtsx_pci_write_register(pcr, SD_PAD_CTL, SD_IO_USING_1V8, 0);
++		break;
++	case OUTPUT_1V8:
++		rtsx_pci_write_register(pcr, LDO_CONFIG2,
++			LDO_D3318_MASK, LDO_D3318_18V);
++		rtsx_pci_write_register(pcr, SD_PAD_CTL, SD_IO_USING_1V8,
++			SD_IO_USING_1V8);
++		break;
++	default:
++		return -EINVAL;
++	}
++
++	rtsx_pci_init_cmd(pcr);
++	rts5249_fill_driving(pcr, voltage);
++	return rtsx_pci_send_cmd(pcr, 100);
++}
++
++static int rts525a_optimize_phy(struct rtsx_pcr *pcr)
++{
++	int err;
++
++	err = rtsx_pci_write_register(pcr, RTS524A_PM_CTRL3,
++		D3_DELINK_MODE_EN, 0x00);
++	if (err < 0)
++		return err;
++
++	rtsx_pci_write_phy_register(pcr, _PHY_FLD0,
++		_PHY_FLD0_CLK_REQ_20C | _PHY_FLD0_RX_IDLE_EN |
++		_PHY_FLD0_BIT_ERR_RSTN | _PHY_FLD0_BER_COUNT |
++		_PHY_FLD0_BER_TIMER | _PHY_FLD0_CHECK_EN);
++
++	rtsx_pci_write_phy_register(pcr, _PHY_ANA03,
++		_PHY_ANA03_TIMER_MAX | _PHY_ANA03_OOBS_DEB_EN |
++		_PHY_CMU_DEBUG_EN);
++
++	if (is_version(pcr, 0x525A, IC_VER_A))
++		rtsx_pci_write_phy_register(pcr, _PHY_REV0,
++			_PHY_REV0_FILTER_OUT | _PHY_REV0_CDR_BYPASS_PFD |
++			_PHY_REV0_CDR_RX_IDLE_BYPASS);
++
++	return 0;
++}
++
++static int rts525a_extra_init_hw(struct rtsx_pcr *pcr)
++{
++	rts5249_extra_init_hw(pcr);
++
++	rtsx_pci_write_register(pcr, PCLK_CTL, PCLK_MODE_SEL, PCLK_MODE_SEL);
++	if (is_version(pcr, 0x525A, IC_VER_A)) {
++		rtsx_pci_write_register(pcr, L1SUB_CONFIG2,
++			L1SUB_AUTO_CFG, L1SUB_AUTO_CFG);
++		rtsx_pci_write_register(pcr, RREF_CFG,
++			RREF_VBGSEL_MASK, RREF_VBGSEL_1V25);
++		rtsx_pci_write_register(pcr, LDO_VIO_CFG,
++			LDO_VIO_TUNE_MASK, LDO_VIO_1V7);
++		rtsx_pci_write_register(pcr, LDO_DV12S_CFG,
++			LDO_D12_TUNE_MASK, LDO_D12_TUNE_DF);
++		rtsx_pci_write_register(pcr, LDO_AV12S_CFG,
++			LDO_AV12S_TUNE_MASK, LDO_AV12S_TUNE_DF);
++		rtsx_pci_write_register(pcr, LDO_VCC_CFG0,
++			LDO_VCC_LMTVTH_MASK, LDO_VCC_LMTVTH_2A);
++		rtsx_pci_write_register(pcr, OOBS_CONFIG,
++			OOBS_AUTOK_DIS | OOBS_VAL_MASK, 0x89);
++	}
++
++	return 0;
++}
++
++static const struct pcr_ops rts525a_pcr_ops = {
++	.fetch_vendor_settings = rtsx_base_fetch_vendor_settings,
++	.extra_init_hw = rts525a_extra_init_hw,
++	.optimize_phy = rts525a_optimize_phy,
++	.turn_on_led = rts5249_turn_on_led,
++	.turn_off_led = rts5249_turn_off_led,
++	.enable_auto_blink = rts5249_enable_auto_blink,
++	.disable_auto_blink = rts5249_disable_auto_blink,
++	.card_power_on = rts525a_card_power_on,
++	.card_power_off = rts5249_card_power_off,
++	.switch_output_voltage = rts525a_switch_output_voltage,
++	.force_power_down = rtsx_base_force_power_down,
++};
++
++void rts525a_init_params(struct rtsx_pcr *pcr)
++{
++	rts5249_init_params(pcr);
++
++	pcr->reg_pm_ctrl3 = RTS524A_PM_CTRL3;
++	pcr->ops = &rts525a_pcr_ops;
++}
++
+diff --git a/drivers/mfd/rtsx_pcr.c b/drivers/mfd/rtsx_pcr.c
+index 22946af..b538028 100644
+--- a/drivers/mfd/rtsx_pcr.c
++++ b/drivers/mfd/rtsx_pcr.c
+@@ -59,6 +59,7 @@ static const struct pci_device_id rtsx_pci_ids[] = {
+ 	{ PCI_DEVICE(0x10EC, 0x522A), PCI_CLASS_OTHERS << 16, 0xFF0000 },
+ 	{ PCI_DEVICE(0x10EC, 0x5249), PCI_CLASS_OTHERS << 16, 0xFF0000 },
+ 	{ PCI_DEVICE(0x10EC, 0x5287), PCI_CLASS_OTHERS << 16, 0xFF0000 },
++	{ PCI_DEVICE(0x10EC, 0x525A), PCI_CLASS_OTHERS << 16, 0xFF0000 },
+ 	{ 0, }
+ };
+ 
+@@ -1091,6 +1092,9 @@ static int rtsx_pci_init_chip(struct rtsx_pcr *pcr)
+ 		rtl8411b_init_params(pcr);
+ 		break;
+ #endif
++	case 0x525A:
++		rts525a_init_params(pcr);
++		break;
+ 	}
+ 
+ 	dev_dbg(&(pcr->pci->dev), "PID: 0x%04x, IC version: 0x%02x\n",
+@@ -1129,7 +1133,7 @@ static int rtsx_pci_probe(struct pci_dev *pcidev,
+ 	struct rtsx_pcr *pcr;
+ 	struct pcr_handle *handle;
+ 	u32 base, len;
+-	int ret, i;
++	int ret, i, bar = 0;
+ 
+ 	dev_dbg(&(pcidev->dev),
+ 		": Realtek PCI-E Card Reader found at %s [%04x:%04x] (rev %x)\n",
+@@ -1175,8 +1179,10 @@ static int rtsx_pci_probe(struct pci_dev *pcidev,
+ 	pcr->pci = pcidev;
+ 	dev_set_drvdata(&pcidev->dev, handle);
+ 
+-	len = pci_resource_len(pcidev, 0);
+-	base = pci_resource_start(pcidev, 0);
++	if (CHK_PCI_PID(pcr, 0x525A))
++		bar = 1;
++	len = pci_resource_len(pcidev, bar);
++	base = pci_resource_start(pcidev, bar);
+ 	pcr->remap_addr = ioremap_nocache(base, len);
+ 	if (!pcr->remap_addr) {
+ 		ret = -ENOMEM;
+diff --git a/drivers/mfd/rtsx_pcr.h b/drivers/mfd/rtsx_pcr.h
+index 3b76e13..004d583 100644
+--- a/drivers/mfd/rtsx_pcr.h
++++ b/drivers/mfd/rtsx_pcr.h
+@@ -28,6 +28,7 @@
+ #define MAX_DIV_N_PCR		208
+ 
+ #define RTS522A_PM_CTRL3		0xFF7E
++#define RTS524A_PM_CTRL3		0xFF7E
+ 
+ int __rtsx_pci_write_phy_register(struct rtsx_pcr *pcr, u8 addr, u16 val);
+ int __rtsx_pci_read_phy_register(struct rtsx_pcr *pcr, u8 addr, u16 *val);
+@@ -38,6 +39,7 @@ void rtl8411_init_params(struct rtsx_pcr *pcr);
+ void rts5227_init_params(struct rtsx_pcr *pcr);
+ void rts522a_init_params(struct rtsx_pcr *pcr);
+ void rts5249_init_params(struct rtsx_pcr *pcr);
++void rts525a_init_params(struct rtsx_pcr *pcr);
+ void rtl8411b_init_params(struct rtsx_pcr *pcr);
+ 
+ static inline u8 map_sd_drive(int idx)
+diff --git a/include/linux/mfd/rtsx_pci.h b/include/linux/mfd/rtsx_pci.h
+index 898dc7c..6a4034e 100644
+--- a/include/linux/mfd/rtsx_pci.h
++++ b/include/linux/mfd/rtsx_pci.h
+@@ -831,6 +831,11 @@
+ #define   PHY_SSCCR3_STEP_IN		0x2740
+ #define   PHY_SSCCR3_CHECK_DELAY	0x0008
+ 
++#define _PHY_ANA03			0x03
++#define   _PHY_ANA03_TIMER_MAX		0x2700
++#define   _PHY_ANA03_OOBS_DEB_EN	0x0040
++#define   _PHY_CMU_DEBUG_EN		0x0008
++
+ #define PHY_RTCR			0x04
+ #define PHY_RDR				0x05
+ #define   PHY_RDR_RXDSEL_1_9		0x4000
+@@ -889,6 +894,12 @@
+ #define   PHY_REV_RX_PWST		0x0008
+ #define   PHY_REV_STOP_CLKWR		0x0004
+ 
++#define _PHY_REV0			0x19
++#define   _PHY_REV0_FILTER_OUT		0x3800
++#define   _PHY_REV0_CDR_BYPASS_PFD	0x0100
++#define   _PHY_REV0_CDR_RX_IDLE_BYPASS	0x0002
++
++
+ #define PHY_FLD0			0x1A
+ #define PHY_ANA1A			0x1A
+ #define   PHY_ANA1A_TXR_LOOPBACK	0x2000
+@@ -906,6 +917,14 @@
+ #define PHY_ANA1D			0x1D
+ #define   PHY_ANA1D_DEBUG_ADDR		0x0004
+ 
++#define _PHY_FLD0			0x1D
++#define   _PHY_FLD0_CLK_REQ_20C		0x8000
++#define   _PHY_FLD0_RX_IDLE_EN		0x1000
++#define   _PHY_FLD0_BIT_ERR_RSTN	0x0800
++#define   _PHY_FLD0_BER_COUNT		0x01E0
++#define   _PHY_FLD0_BER_TIMER		0x001E
++#define   _PHY_FLD0_CHECK_EN		0x0001
++
+ #define PHY_FLD4			0x1E
+ #define   PHY_FLD4_FLDEN_SEL		0x4000
+ #define   PHY_FLD4_REQ_REF		0x2000
+-- 
+1.7.1
+
